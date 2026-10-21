@@ -17,6 +17,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * One addon server, and every question this app knows how to ask it.
@@ -346,10 +348,23 @@ class AddonClient(rawBaseUrl: String) {
                 .header("Accept", "application/json")
                 .header("User-Agent", USER_AGENT)
 
-            // LastWave distinguishes playback requests from downloads. BitChord
-            // only resolves playback streams here; searches and manifests need
-            // no intent header.
-            val path = url.substringBefore('?').substringAfter("://").substringAfter('/')
+            // LastWave uses a timestamped HMAC signature for tokenized /a/{token}
+            // endpoints. The secret below is LastWave's published client fallback,
+            // not a private per-user credential; deployments with a custom secret
+            // will still need an explicit secret setting.
+            val requestUrl = url.toHttpUrlOrNull()
+            val path = requestUrl?.encodedPath ?: "/"
+            val tokenMatch = LASTWAVE_TOKEN.find(path)
+            if (tokenMatch != null) {
+                val timestamp = (System.currentTimeMillis() / 1000L).toString()
+                val method = "GET"
+                val message = "$timestamp\n$method\n$path\n${tokenMatch.groupValues[1]}"
+                val signature = signLastWave(message)
+                requestBuilder.header("X-LW-TS", timestamp)
+                    .header("X-LW-Sign", signature)
+            }
+
+            // LastWave distinguishes playback requests from downloads.
             if (path.contains("/stream/")) {
                 requestBuilder.header("X-LW-Intent", "stream")
             }
@@ -521,6 +536,20 @@ class AddonClient(rawBaseUrl: String) {
          * proves less than one that usually comes back full.
          */
         private const val PROBE_QUERY = "music"
+
+        private val LASTWAVE_TOKEN = Regex("""/a/([^/]+)""")
+
+        // Public fallback used by LastWave-compatible addon clients. This is
+        // protocol compatibility, not a secure app secret.
+        private const val LASTWAVE_DEFAULT_SECRET =
+            "36d96a751b12ee481c281a8e8e64c482d0c1634a22061ab72f40175017818b85"
+
+        private fun signLastWave(message: String): String {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(LASTWAVE_DEFAULT_SECRET.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            return mac.doFinal(message.toByteArray(Charsets.UTF_8))
+                .joinToString("") { byte -> "%02x".format(byte) }
+        }
 
         /**
          * The shared client, with a ceiling on the whole call.
