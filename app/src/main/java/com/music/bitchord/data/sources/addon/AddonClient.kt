@@ -12,10 +12,13 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromJsonElement
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.concurrent.TimeUnit
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * One addon server, and every question this app knows how to ask it.
@@ -228,7 +231,10 @@ class AddonClient(rawBaseUrl: String) {
                     ?: ATMOS_NEVER
             }
         } else {
-            atmosHint()?.let { params.putIfAbsent(ATMOS_KEY, it) }
+            // Match LastWave Native: explicitly disable Atmos when it is not requested.
+            // Otherwise the addon may return an Atmos-only stream by default, which
+            // BitChord can reject and then fall back to YouTube.
+            params[ATMOS_KEY] = atmosHint() ?: ATMOS_NEVER
         }
         return params
     }
@@ -304,15 +310,22 @@ class AddonClient(rawBaseUrl: String) {
     }
 
     private suspend inline fun <reified T> fetch(url: String): Result<T> =
-        runCatching { json.decodeFromString<T>(body(url)) }
-            .onFailure { failure ->
-                if (failure is CancellationException) throw failure
-                // A miss is not worth a line. Everything else is: this is the
-                // only place that knows why an addon didn't answer.
-                if (failure !is AddonNotFound) {
-                    TrackLog.w(TAG, "  ✗ addon call failed ${redact(url)}: ${failure.message}")
-                }
+        runCatching {
+            val root = json.parseToJsonElement(body(url))
+            // LastWave wraps stream payloads in either {"stream": {...}} or
+            // {"data": {...}}. Keep accepting the unwrapped protocol used by
+            // existing BitChord add-ons, and tolerate both wrappers.
+            val objectRoot = root as? kotlinx.serialization.json.JsonObject
+            val payload = if (T::class == AddonStream::class) {
+                objectRoot?.get("stream") ?: objectRoot?.get("data") ?: root
+            } else root
+            json.decodeFromJsonElement<T>(payload)
+        }.onFailure { failure ->
+            if (failure is CancellationException) throw failure
+            if (failure !is AddonNotFound) {
+                TrackLog.w(TAG, "  ✗ addon call failed ${redact(url)}: ${failure.message}")
             }
+        }
 
     /**
      * One GET, with the addon's own back-pressure honoured.
@@ -334,10 +347,35 @@ class AddonClient(rawBaseUrl: String) {
         while (true) {
             (quietUntilMs - System.currentTimeMillis()).takeIf { it > 0 }?.let { delay(it) }
 
-            val request = Request.Builder().url(url)
+            val requestBuilder = Request.Builder().url(url)
                 .header("Accept", "application/json")
                 .header("User-Agent", USER_AGENT)
-                .build()
+
+            // LastWave uses a timestamped HMAC signature for tokenized /a/{token}
+            // endpoints. The secret below is LastWave's published client fallback,
+            // not a private per-user credential; deployments with a custom secret
+            // will still need an explicit secret setting.
+            val requestUrl = url.toHttpUrlOrNull()
+            val path = requestUrl?.encodedPath ?: "/"
+            val tokenMatch = LASTWAVE_TOKEN.find(path)
+            if (tokenMatch != null) {
+                val timestamp = (System.currentTimeMillis() / 1000L).toString()
+                val method = "GET"
+                val message = "$timestamp\n$method\n$path\n${tokenMatch.groupValues[1]}"
+                val signature = signLastWave(message)
+                requestBuilder.header("X-LW-TS", timestamp)
+                    .header("X-LW-Sign", signature)
+            }
+
+            // LastWave distinguishes playback requests from downloads.
+            if (path.contains("/stream/")) {
+                // Match the native LastWave player client: some addon deployments
+                // route playback differently based on this exact user agent.
+                requestBuilder
+                    .header("X-LW-Intent", "stream")
+                    .header("User-Agent", LASTWAVE_PLAYER_USER_AGENT)
+            }
+            val request = requestBuilder.build()
 
             val wait = client.newCall(request).execute().use { response ->
                 when {
@@ -505,6 +543,21 @@ class AddonClient(rawBaseUrl: String) {
          * proves less than one that usually comes back full.
          */
         private const val PROBE_QUERY = "music"
+        private const val LASTWAVE_PLAYER_USER_AGENT = "LastWave-Player/1.0"
+
+        private val LASTWAVE_TOKEN = Regex("""/a/([^/]+)""")
+
+        // Public fallback used by LastWave-compatible addon clients. This is
+        // protocol compatibility, not a secure app secret.
+        private const val LASTWAVE_DEFAULT_SECRET =
+            "36d96a751b12ee481c281a8e8e64c482d0c1634a22061ab72f40175017818b85"
+
+        private fun signLastWave(message: String): String {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(LASTWAVE_DEFAULT_SECRET.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+            return mac.doFinal(message.toByteArray(Charsets.UTF_8))
+                .joinToString("") { byte -> "%02x".format(byte) }
+        }
 
         /**
          * The shared client, with a ceiling on the whole call.
