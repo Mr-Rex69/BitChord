@@ -366,7 +366,11 @@ class AddonClient(rawBaseUrl: String) {
 
             // LastWave distinguishes playback requests from downloads.
             if (path.contains("/stream/")) {
-                requestBuilder.header("X-LW-Intent", "stream")
+                // Match the native LastWave player client: some addon deployments
+                // route playback differently based on this exact user agent.
+                requestBuilder
+                    .header("X-LW-Intent", "stream")
+                    .header("User-Agent", LASTWAVE_PLAYER_USER_AGENT)
             }
             val request = requestBuilder.build()
 
@@ -536,6 +540,7 @@ class AddonClient(rawBaseUrl: String) {
          * proves less than one that usually comes back full.
          */
         private const val PROBE_QUERY = "music"
+        private const val LASTWAVE_PLAYER_USER_AGENT = "LastWave-Player/1.0"
 
         private val LASTWAVE_TOKEN = Regex("""/a/([^/]+)""")
 
