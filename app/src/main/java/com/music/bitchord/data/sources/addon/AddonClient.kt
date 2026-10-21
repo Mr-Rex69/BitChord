@@ -231,7 +231,10 @@ class AddonClient(rawBaseUrl: String) {
                     ?: ATMOS_NEVER
             }
         } else {
-            atmosHint()?.let { params.putIfAbsent(ATMOS_KEY, it) }
+            // Match LastWave Native: explicitly disable Atmos when it is not requested.
+            // Otherwise the addon may return an Atmos-only stream by default, which
+            // BitChord can reject and then fall back to YouTube.
+            params[ATMOS_KEY] = atmosHint() ?: ATMOS_NEVER
         }
         return params
     }
