@@ -305,15 +305,22 @@ class AddonClient(rawBaseUrl: String) {
     }
 
     private suspend inline fun <reified T> fetch(url: String): Result<T> =
-        runCatching { json.decodeFromString<T>(body(url)) }
-            .onFailure { failure ->
-                if (failure is CancellationException) throw failure
-                // A miss is not worth a line. Everything else is: this is the
-                // only place that knows why an addon didn't answer.
-                if (failure !is AddonNotFound) {
-                    TrackLog.w(TAG, "  ✗ addon call failed ${redact(url)}: ${failure.message}")
-                }
+        runCatching {
+            val root = json.parseToJsonElement(body(url))
+            // LastWave wraps stream payloads in either {"stream": {...}} or
+            // {"data": {...}}. Keep accepting the unwrapped protocol used by
+            // existing BitChord add-ons, and tolerate both wrappers.
+            val objectRoot = root as? kotlinx.serialization.json.JsonObject
+            val payload = if (T::class == AddonStream::class) {
+                objectRoot?.get("stream") ?: objectRoot?.get("data") ?: root
+            } else root
+            json.decodeFromJsonElement<T>(payload)
+        }.onFailure { failure ->
+            if (failure is CancellationException) throw failure
+            if (failure !is AddonNotFound) {
+                TrackLog.w(TAG, "  ✗ addon call failed ${redact(url)}: ${failure.message}")
             }
+        }
 
     /**
      * One GET, with the addon's own back-pressure honoured.
@@ -335,10 +342,18 @@ class AddonClient(rawBaseUrl: String) {
         while (true) {
             (quietUntilMs - System.currentTimeMillis()).takeIf { it > 0 }?.let { delay(it) }
 
-            val request = Request.Builder().url(url)
+            val requestBuilder = Request.Builder().url(url)
                 .header("Accept", "application/json")
                 .header("User-Agent", USER_AGENT)
-                .build()
+
+            // LastWave distinguishes playback requests from downloads. BitChord
+            // only resolves playback streams here; searches and manifests need
+            // no intent header.
+            val path = url.substringBefore('?').substringAfter("://").substringAfter('/')
+            if (path.contains("/stream/")) {
+                requestBuilder.header("X-LW-Intent", "stream")
+            }
+            val request = requestBuilder.build()
 
             val wait = client.newCall(request).execute().use { response ->
                 when {
